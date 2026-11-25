@@ -430,10 +430,18 @@ pub(crate) mod test_support {
         let output = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .env("HOMECERT_ACL_PATH", path)
+            // A module path inherited from PowerShell 7 makes Windows
+            // PowerShell load the wrong security module, and `Get-Acl` then
+            // fails without a failing exit code.
+            .env_remove("PSModulePath")
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "Get-Acl failed: {text}");
+        let errors = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && errors.trim().is_empty(),
+            "Get-Acl failed: {text} {errors}"
+        );
         let user = super::windows::current_user_sid().unwrap();
         let sids: Vec<&str> = text
             .lines()
