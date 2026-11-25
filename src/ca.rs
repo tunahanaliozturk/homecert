@@ -112,7 +112,10 @@ impl Leaf {
 impl Ca {
     /// Creates a new root and intermediate, both carrying `constraints`. The
     /// root key is generated here, signs the intermediate and is dropped
-    /// before this function returns; it is never serialised.
+    /// before this function returns; it is never written to disk. It is not
+    /// wiped from memory either: rcgen holds the key as a PKCS #8 document in
+    /// a heap buffer that is not zeroed on drop, so the bytes can stay in
+    /// freed memory until it is reused (ADR 0002 says what that means).
     ///
     /// # Errors
     ///
