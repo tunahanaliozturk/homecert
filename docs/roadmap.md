@@ -34,6 +34,7 @@ Each milestone ends with a test that has to pass. A milestone is not done becaus
     - Certificates: only the exact IPv4 and IPv6 exclusion reads back as "no IP addresses", a leaf never outlives the intermediate, and leaf serials are 16 random bytes instead of a hash of the key.
     - Names: a wildcard's `*.` counts towards 253 characters.
     - Only CI can confirm the Unix side of these changes; the Windows-only tests above run on Windows only.
+  - First CI run, 2026-11-25: on `windows-latest`, elevated, three owner-only tests failed with SYSTEM, Administrators and the user in the DACL. `icacls /inheritance:r` removes only inherited entries, and an object whose parent passes nothing down gets the token's default DACL as explicit entries. Reproduced unelevated by `entries_from_the_default_dacl_are_removed`, which failed with the same three SIDs. The fix runs `icacls /reset` first ([ADR 0008](adr/0008-windows-dacl-through-icacls-reset.md)); `icacls /restore` was tried and needs `SeRestorePrivilege`. The test check now requires exactly one entry with full control, inheritable on a directory: dropping `/reset` for the directory alone, and granting the directory a non-inheritable entry, were each made by hand and failed it. The elevated run itself is for CI to confirm.
 
 ## Order of work inside a milestone
 
