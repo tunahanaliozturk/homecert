@@ -159,20 +159,44 @@ fn fill(file: &mut File, tmp: &Path, bytes: &[u8]) -> Result<(), Error> {
 /// hard link, which fails if `path` exists, so a file created since the check
 /// in [`write_file`] is not replaced either.
 // ponytail: hard links need a file system that has them (NTFS, ext4, APFS);
-// FAT and some network shares fail here with a clear I/O error.
+// on FAT and some network shares the write fails, and `link_error` says that
+// a hard link was the cause.
 fn place(tmp: &Path, path: &Path, overwrite: Overwrite) -> Result<(), Error> {
     match overwrite {
         Overwrite::Replace => fs::rename(tmp, path).map_err(|e| Error::io(path, e)),
         Overwrite::Refuse => {
-            fs::hard_link(tmp, path).map_err(|e| match e.kind() {
-                std::io::ErrorKind::AlreadyExists => Error::Exists(path.to_owned()),
-                _ => Error::io(path, e),
-            })?;
+            fs::hard_link(tmp, path).map_err(|e| link_error(path, &e))?;
             // The file is in place now. A temporary name left behind is
             // untidy, not a failed write.
             fs::remove_file(tmp).ok();
             Ok(())
         }
+    }
+}
+
+/// The error for a failed hard link. Any failure other than an existing
+/// target names the hard link, because on a file system without them (FAT,
+/// some network shares) the OS error alone, such as "unsupported" or "access
+/// denied", does not say what homecert tried to do.
+///
+/// There is deliberately no fallback to creating the target directly: that
+/// would write the key under its final name a piece at a time, so a crash or
+/// a full disk would leave a partial key there, which a rerun then refuses to
+/// replace. An error that points at the cause lets the user pick another
+/// directory instead.
+fn link_error(path: &Path, e: &std::io::Error) -> Error {
+    match e.kind() {
+        std::io::ErrorKind::AlreadyExists => Error::Exists(path.to_owned()),
+        kind => Error::io(
+            path,
+            std::io::Error::new(
+                kind,
+                format!(
+                    "cannot create a hard link ({e}); homecert writes a file it must not \
+                     replace through a hard link, which this file system may not support"
+                ),
+            ),
+        ),
     }
 }
 
@@ -468,6 +492,16 @@ mod tests {
             .unwrap();
         place(&temp, &path, Overwrite::Refuse).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn a_failed_hard_link_says_so() {
+        let path = Path::new("key.pem");
+        let exists = link_error(path, &std::io::ErrorKind::AlreadyExists.into());
+        assert!(matches!(exists, Error::Exists(_)), "{exists}");
+        // FAT and some network shares have no hard links.
+        let unsupported = link_error(path, &std::io::ErrorKind::Unsupported.into()).to_string();
+        assert!(unsupported.contains("hard link"), "{unsupported}");
     }
 
     /// An empty or relative `SystemRoot` would make `icacls` and `whoami`
