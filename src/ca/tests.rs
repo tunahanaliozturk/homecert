@@ -181,6 +181,28 @@ fn issue_refuses_a_name_outside_the_constraints() {
 }
 
 #[test]
+fn a_leaf_does_not_outlive_its_issuer() {
+    // A CA ten days from its end, read back from disk, and one fresh from
+    // `Ca::create`: a 365-day leaf from either ends with the intermediate.
+    let now = OffsetDateTime::now_utc();
+    let created = Ca::create(Constraints::local(), now - Duration::days(CA_DAYS - 10)).unwrap();
+    let loaded = Ca::from_pem(
+        created.root_pem(),
+        created.issuer_pem(),
+        &created.issuer_key_pem(),
+    )
+    .unwrap();
+    for ca in [&created, &loaded] {
+        let leaf = ca
+            .issue(&names(&["app.test"]), LeafDays::default(), now)
+            .unwrap();
+        let chain = ders(leaf.chain_pem());
+        let (leaf, issuer) = (parse(&chain[0]), parse(&chain[1]));
+        assert_eq!(leaf.validity().not_after, issuer.validity().not_after);
+    }
+}
+
+#[test]
 fn leaf_validity_is_one_to_825_days() {
     assert!(LeafDays::new(0).is_err());
     assert!(LeafDays::new(826).is_err());

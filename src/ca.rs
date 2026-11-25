@@ -67,6 +67,7 @@ pub struct Ca {
     root_pem: String,
     issuer_pem: String,
     issuer_key: KeyPair,
+    issuer_not_after: OffsetDateTime,
     constraints: Constraints,
 }
 
@@ -153,6 +154,7 @@ impl Ca {
             root_pem,
             issuer_pem: issuer_cert.pem(),
             issuer_key,
+            issuer_not_after: not_after,
             constraints,
         })
     }
@@ -204,6 +206,7 @@ impl Ca {
             root_pem: root_pem.to_owned(),
             issuer_pem: issuer_pem.to_owned(),
             issuer_key,
+            issuer_not_after: issuer.validity().not_after.to_datetime(),
             constraints,
         })
     }
@@ -232,8 +235,9 @@ impl Ca {
         &self.constraints
     }
 
-    /// Issues a leaf for `names`, valid from `now` for `days`. Every name is
-    /// checked with [`permits`] first.
+    /// Issues a leaf for `names`, valid from `now` for `days`, but never
+    /// past the intermediate's own end. Every name is checked with
+    /// [`permits`] first.
     ///
     /// # Errors
     ///
@@ -274,7 +278,7 @@ impl Ca {
         }
         let mut params = CertificateParams::default();
         params.not_before = now;
-        params.not_after = now + Duration::days(i64::from(days.get()));
+        params.not_after = (now + Duration::days(i64::from(days.get()))).min(self.issuer_not_after);
         params.distinguished_name = leaf_subject(names);
         params.is_ca = IsCa::ExplicitNoCa;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
