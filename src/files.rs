@@ -2,9 +2,10 @@
 //!
 //! On Unix a private file is created with mode 0600 and the CA directory with
 //! 0700, so neither ever exists with wider permissions. On Windows the file or
-//! directory gets a protected DACL with one entry, full control for the
-//! current user's SID, set with `icacls` before any secret is written; a file
-//! is held open with share mode 0 until then, so no one else can open it.
+//! directory gets a protected DACL with exactly one entry, full control for
+//! the current user's SID, set with `icacls` before any secret is written,
+//! whatever entries it had before; a file is held open with share mode 0
+//! until then, so no one else can open it.
 //!
 //! Every write goes to a temporary file in the target directory, is flushed,
 //! and is then moved into place.
@@ -350,14 +351,29 @@ pub(crate) mod windows {
         Ok(sid.to_owned())
     }
 
-    /// Removes inherited entries and grants `rights` to the current user
-    /// only.
+    /// Sets the DACL to one entry, `rights` for the current user, whatever
+    /// was there before. `/reset` drops every explicit entry, such as those a
+    /// new file gets from the token's default DACL when its parent passes
+    /// nothing down, and leaves only inherited ones; `/inheritance:r` then
+    /// drops those. `icacls` takes `/reset` only on its own, so it runs twice.
+    /// Neither needs a privilege, unlike `/restore` with an SDDL file.
     pub(crate) fn restrict(path: &Path, rights: &str) -> Result<(), Error> {
         let sid = current_user_sid()?;
+        icacls(path, &["/reset".to_owned()])?;
+        icacls(
+            path,
+            &[
+                "/inheritance:r".to_owned(),
+                "/grant:r".to_owned(),
+                format!("*{sid}:{rights}"),
+            ],
+        )
+    }
+
+    fn icacls(path: &Path, args: &[String]) -> Result<(), Error> {
         let output = Command::new(system32("icacls.exe")?)
             .arg(path)
-            .args(["/inheritance:r", "/grant:r"])
-            .arg(format!("*{sid}:{rights}"))
+            .args(args)
             .stdin(Stdio::null())
             .output()
             .map_err(|e| Error::Permissions(format!("cannot run icacls: {e}")))?;
@@ -406,9 +422,11 @@ pub(crate) mod test_support {
         }
     }
 
-    /// Whether only the owner may access `path`: on Unix, no group or other
-    /// bits; on Windows, a protected DACL whose every entry is the current
-    /// user's SID. Returns a description of what is wrong.
+    /// Whether only the owner may access `path`: on Unix, exactly
+    /// `expected_mode`; on Windows, a protected DACL with exactly one entry,
+    /// allowing full control to the current user's SID, not inherited, and
+    /// inherited by children if `path` is a directory. The owner field is not
+    /// checked (see the design). Returns a description of what is wrong.
     #[cfg(unix)]
     pub(crate) fn owner_only(path: &Path, expected_mode: u32) -> Result<(), String> {
         use std::os::unix::fs::PermissionsExt;
@@ -423,10 +441,14 @@ pub(crate) mod test_support {
     /// See the Unix version. Reads the ACL back with PowerShell `Get-Acl`.
     #[cfg(windows)]
     pub(crate) fn owner_only(path: &Path, _expected_mode: u32) -> Result<(), String> {
+        // Enum names such as `FullControl` are not translated, so the output
+        // reads the same in every system language.
         let script = "$a = Get-Acl -LiteralPath $env:HOMECERT_ACL_PATH; \
             'protected ' + $a.AreAccessRulesProtected; \
-            $a.Access | ForEach-Object { 'sid ' + \
-            $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }";
+            $a.Access | ForEach-Object { 'rule ' + (@( \
+            $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value, \
+            $_.AccessControlType, $_.FileSystemRights, $_.IsInherited, \
+            $_.InheritanceFlags, $_.PropagationFlags) -join '|') }";
         let output = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .env("HOMECERT_ACL_PATH", path)
@@ -443,12 +465,18 @@ pub(crate) mod test_support {
             "Get-Acl failed: {text} {errors}"
         );
         let user = super::windows::current_user_sid().unwrap();
-        let sids: Vec<&str> = text
+        let inheritance = if path.is_dir() {
+            "ContainerInherit, ObjectInherit"
+        } else {
+            "None"
+        };
+        let expected = format!("{user}|Allow|FullControl|False|{inheritance}|None");
+        let rules: Vec<&str> = text
             .lines()
-            .filter_map(|l| l.trim().strip_prefix("sid "))
+            .filter_map(|l| l.trim().strip_prefix("rule "))
             .collect();
         let protected = text.lines().any(|l| l.trim() == "protected True");
-        if protected && !sids.is_empty() && sids.iter().all(|sid| *sid == user) {
+        if protected && rules == [expected.as_str()] {
             Ok(())
         } else {
             Err(format!("ACL of {}: {}", path.display(), text.trim()))
@@ -502,6 +530,32 @@ mod tests {
         }
         drop(held);
         assert!(File::open(&path).is_ok());
+    }
+
+    /// When the parent passes no entries down, Windows gives a new file or
+    /// directory the default DACL of the creator's token (SYSTEM, the logon
+    /// session, and Administrators when elevated). Those entries are explicit,
+    /// not inherited, so removing inheritance alone leaves them in place.
+    #[cfg(windows)]
+    #[test]
+    fn entries_from_the_default_dacl_are_removed() {
+        let tmp = TempDir::new();
+        // One entry for the user that children do not inherit.
+        let sid = windows::current_user_sid().unwrap();
+        let status = std::process::Command::new(windows::system32("icacls.exe").unwrap())
+            .arg(tmp.path())
+            .args(["/inheritance:r", "/grant:r", &format!("*{sid}:F")])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let key = tmp.path().join("app.test-key.pem");
+        write_file(&key, b"secret", Access::OwnerOnly, Overwrite::Refuse).unwrap();
+        owner_only(&key, 0o600).unwrap();
+        let dir = CaDir::create(tmp.path().join("ca"), &new_ca()).unwrap();
+        owner_only(dir.path(), 0o700).unwrap();
+        owner_only(&dir.path().join(ISSUER_KEY_FILE), 0o600).unwrap();
     }
 
     /// Once the hard link is made the file is in place; a temporary name that
