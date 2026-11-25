@@ -2,6 +2,7 @@
 //! every name in the table, x509-parser against the profile table in the
 //! design, and `openssl verify` when it is on `PATH`.
 
+use std::io::Write;
 use std::process::Command;
 
 use rustls_pki_types::{CertificateDer, UnixTime};
@@ -109,38 +110,48 @@ fn webpki_agrees_with_permits_on_every_table_name() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-#[test]
-fn webpki_agrees_with_permits_under_other_constraint_lists() {
+/// The constraint lists besides [`Constraints::local`] that every verifier
+/// is asked about.
+fn other_constraint_lists() -> [Constraints; 2] {
     let dns = |n: &str| DnsName::parse(n).unwrap();
-    let lists = [
-        // No IP range: every address must be refused, by both.
+    [
+        // No IP range (ADR 0006): every address must be refused.
         Constraints::new(vec![dns("corp.example")], Vec::new()).unwrap(),
         // IPv4 only: IPv6 addresses must be refused.
         Constraints::new(vec![dns("test")], vec![IpNet::parse("10.0.0.0/8").unwrap()]).unwrap(),
-    ];
-    let inputs = [
-        "corp.example",
-        "a.corp.example",
-        "xcorp.example",
-        "localhost",
-        "app.test",
-        "127.0.0.1",
-        "10.1.2.3",
-        "11.0.0.1",
-        "::1",
-        "::ffff:10.1.2.3",
-        "*.a.corp.example",
-    ];
+    ]
+}
+
+const OTHER_INPUTS: [&str; 11] = [
+    "corp.example",
+    "a.corp.example",
+    "xcorp.example",
+    "localhost",
+    "app.test",
+    "127.0.0.1",
+    "10.1.2.3",
+    "11.0.0.1",
+    "::1",
+    "::ffff:10.1.2.3",
+    "*.a.corp.example",
+];
+
+#[test]
+fn webpki_agrees_with_permits_under_other_constraint_lists() {
     let at = OffsetDateTime::now_utc() + Duration::minutes(1);
-    for constraints in lists {
+    for constraints in other_constraint_lists() {
         let ca = Ca::create(constraints, OffsetDateTime::now_utc()).unwrap();
         let mut verifier = |leaf: &Leaf| webpki_accepts(&ca, leaf, at).map_err(|e| e.to_string());
-        let wrong = disagreements(&ca, &inputs, &mut verifier);
+        let wrong = disagreements(&ca, &OTHER_INPUTS, &mut verifier);
         assert!(
             wrong.is_empty(),
-            "{:?}:\n{}",
+            "{:?}:
+{}",
             ca.constraints(),
-            wrong.join("\n")
+            wrong.join(
+                "
+"
+            )
         );
     }
 }
@@ -531,13 +542,22 @@ fn an_issuer_whose_constraints_differ_from_the_roots_is_refused() {
     );
 }
 
-/// `openssl verify`'s verdict, or `None` when openssl cannot be run.
+/// `openssl verify`'s verdict, or `None` when openssl cannot be run. The
+/// root in `dir` is the only trust anchor: `-no-CApath -no-CAstore` keep
+/// the system's own roots out.
 fn openssl_accepts(dir: &std::path::Path, ca: &Ca, leaf: &Leaf) -> Option<Result<bool, String>> {
     let leaf_only = leaf.chain_pem().strip_suffix(ca.issuer_pem()).unwrap();
     let path = dir.join("leaf.pem");
     std::fs::write(&path, leaf_only).unwrap();
     let output = Command::new("openssl")
-        .args(["verify", "-purpose", "sslserver", "-CAfile"])
+        .args([
+            "verify",
+            "-no-CApath",
+            "-no-CAstore",
+            "-purpose",
+            "sslserver",
+        ])
+        .arg("-CAfile")
         .arg(dir.join(ROOT_FILE))
         .arg("-untrusted")
         .arg(dir.join(ISSUER_FILE))
@@ -558,34 +578,85 @@ fn openssl_accepts(dir: &std::path::Path, ca: &Ca, leaf: &Leaf) -> Option<Result
     })
 }
 
-#[test]
-fn openssl_agrees_with_permits_on_every_table_name() {
-    let tmp = TempDir::new();
-    let ca = Ca::create(Constraints::local(), OffsetDateTime::now_utc()).unwrap();
-    let dir = CaDir::create(tmp.path().join("ca"), &ca).unwrap();
+/// Whether `openssl` on `PATH` is OpenSSL. If not, says on stderr why
+/// `test` is skipped. It writes to the stderr handle rather than through
+/// `eprintln!`, which the test harness captures, so the skip shows in the
+/// normal `cargo test` output.
+fn openssl_or_skip(test: &str) -> bool {
     // OpenSSL only. macOS ships LibreSSL as `openssl`, a different verifier
-    // that the M2 consumer probe covers on its own; when neither is there,
-    // the webpki cross-check above still runs.
-    let is_openssl = Command::new("openssl")
-        .arg("version")
-        .output()
-        .is_ok_and(|out| out.status.success() && out.stdout.starts_with(b"OpenSSL "));
-    if !is_openssl {
-        return;
-    }
+    // that the M2 consumer probe covers on its own; without OpenSSL the
+    // webpki cross-checks still run.
+    let reason = match Command::new("openssl").arg("version").output() {
+        Ok(out) if out.status.success() && out.stdout.starts_with(b"OpenSSL ") => return true,
+        Ok(out) => format!(
+            "`openssl version` says {:?}, which is not OpenSSL",
+            String::from_utf8_lossy(&out.stdout).trim()
+        ),
+        Err(e) => format!("cannot run openssl: {e}"),
+    };
+    writeln!(std::io::stderr(), "skipped {test}: {reason}").unwrap();
+    false
+}
+
+/// Every parseable name in `inputs` through `openssl verify`, under a fresh
+/// CA with `constraints`. Returns the disagreements with `permits`.
+fn openssl_disagreements(constraints: Constraints, inputs: &[&str]) -> Vec<String> {
+    let tmp = TempDir::new();
+    let ca = Ca::create(constraints, OffsetDateTime::now_utc()).unwrap();
+    let dir = CaDir::create(tmp.path().join("ca"), &ca).unwrap();
     let mut verifier = |leaf: &Leaf| openssl_accepts(dir.path(), &ca, leaf).unwrap();
-    let mut wrong = disagreements(&ca, &table_inputs(), &mut verifier);
-    // A leaf with several names, and one with only an address, must verify too.
-    for list in [
-        &["app.test", "localhost", "127.0.0.1", "::1", "*.app.test"][..],
-        &["127.0.0.1"],
-    ] {
-        let leaf = ca
-            .issue(&names(list), LeafDays::default(), OffsetDateTime::now_utc())
-            .unwrap();
-        if openssl_accepts(dir.path(), &ca, &leaf) != Some(Ok(true)) {
-            wrong.push(format!("{list:?} was not accepted"));
+    let mut wrong: Vec<String> = disagreements(&ca, inputs, &mut verifier)
+        .into_iter()
+        .map(|w| format!("{:?}: {w}", ca.constraints()))
+        .collect();
+    if *ca.constraints() == Constraints::local() {
+        // A leaf with several names, and one with only an address, must verify too.
+        for list in [
+            &["app.test", "localhost", "127.0.0.1", "::1", "*.app.test"][..],
+            &["127.0.0.1"],
+        ] {
+            let leaf = ca
+                .issue(&names(list), LeafDays::default(), OffsetDateTime::now_utc())
+                .unwrap();
+            if openssl_accepts(dir.path(), &ca, &leaf) != Some(Ok(true)) {
+                wrong.push(format!("{list:?} was not accepted"));
+            }
         }
     }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    wrong
+}
+
+#[test]
+fn openssl_agrees_with_permits_on_every_table_name() {
+    if !openssl_or_skip("openssl_agrees_with_permits_on_every_table_name") {
+        return;
+    }
+    let wrong = openssl_disagreements(Constraints::local(), &table_inputs());
+    assert!(
+        wrong.is_empty(),
+        "{}",
+        wrong.join(
+            "
+"
+        )
+    );
+}
+
+#[test]
+fn openssl_agrees_with_permits_under_other_constraint_lists() {
+    if !openssl_or_skip("openssl_agrees_with_permits_under_other_constraint_lists") {
+        return;
+    }
+    let wrong: Vec<String> = other_constraint_lists()
+        .into_iter()
+        .flat_map(|constraints| openssl_disagreements(constraints, &OTHER_INPUTS))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "{}",
+        wrong.join(
+            "
+"
+        )
+    );
 }
