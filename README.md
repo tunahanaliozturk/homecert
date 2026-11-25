@@ -10,7 +10,7 @@ Milestone M1 is built: the name rules, the root, intermediate and leaf certifica
 
 - `permits`, the check that decides whether a name may be issued, agrees with rustls-webpki and with OpenSSL on 65 names, including label traps such as `xtest`, `evil-home.arpa` and `::ffff:127.0.0.1` (`src/ca/tests.rs`).
 - The root key is never written: the CA directory holds the root certificate, the intermediate and the intermediate's key, nothing else (`the_root_key_is_never_stored`).
-- Key files are owner-only on Windows (a one-entry DACL, read back with `Get-Acl`) and are never written over an existing file (`src/files.rs`).
+- Key files are owner-only on Windows (a one-entry DACL, read back with `Get-Acl`). The file is held open with no sharing until the DACL is set, so no one can open it in between (`no_one_can_open_a_file_while_it_is_being_written`). Key files are never written over an existing file (`src/files.rs`).
 
 
 - [docs/design.md](docs/design.md): the problem, the commands, the architecture, the hard parts and how each promise is tested.

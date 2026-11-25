@@ -3,7 +3,8 @@
 //! On Unix a private file is created with mode 0600 and the CA directory with
 //! 0700, so neither ever exists with wider permissions. On Windows the file or
 //! directory gets a protected DACL with one entry, full control for the
-//! current user's SID, set with `icacls` before any secret is written.
+//! current user's SID, set with `icacls` before any secret is written; a file
+//! is held open with share mode 0 until then, so no one else can open it.
 //!
 //! Every write goes to a temporary file in the target directory, is flushed,
 //! and is then moved into place.
@@ -199,12 +200,19 @@ fn create_new(path: &Path, access: Access) -> Result<File, Error> {
         .map_err(|e| Error::io(path, e))
 }
 
-/// See the Unix version.
+/// See the Unix version. Until `icacls` has run, the file has the
+/// directory's inherited permissions, so it is opened with share mode 0:
+/// while the writer holds it, every other open fails with a sharing
+/// violation, and no handle can be opened early to read what is written
+/// later. `icacls` still works, because changing the DACL is not a read or
+/// a write of the file's data.
 #[cfg(windows)]
 fn create_new(path: &Path, access: Access) -> Result<File, Error> {
+    use std::os::windows::fs::OpenOptionsExt;
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
+        .share_mode(0)
         .open(path)
         .map_err(|e| Error::io(path, e))?;
     if access == Access::OwnerOnly
@@ -400,6 +408,27 @@ mod tests {
         write_file(&path, b"secret", Access::OwnerOnly, Overwrite::Refuse).unwrap();
         owner_only(&path, 0o600).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"secret");
+    }
+
+    /// Between creating a file and `icacls`, the file has the directory's
+    /// inherited permissions. A handle opened then would read every byte
+    /// written later, so nobody may open the file while the writer holds it.
+    #[cfg(windows)]
+    #[test]
+    fn no_one_can_open_a_file_while_it_is_being_written() {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        let tmp = TempDir::new();
+        let path = tmp.path().join("app.test-key.pem");
+        let held = create_new(&path, Access::OwnerOnly).unwrap();
+        for open in [
+            OpenOptions::new().read(true).open(&path),
+            OpenOptions::new().write(true).open(&path),
+        ] {
+            let err = open.unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(ERROR_SHARING_VIOLATION), "{err}");
+        }
+        drop(held);
+        assert!(File::open(&path).is_ok());
     }
 
     #[test]
