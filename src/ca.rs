@@ -13,6 +13,7 @@ use rcgen::{
     NameConstraints, PKCS_ECDSA_P256_SHA256, SanType,
 };
 use ring::rand::{SecureRandom, SystemRandom};
+use ring::signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey};
 use time::{Duration, OffsetDateTime};
 use x509_parser::extensions::GeneralName;
 use x509_parser::prelude::{FromDer, X509Certificate};
@@ -162,7 +163,10 @@ impl Ca {
     /// # Errors
     ///
     /// [`Error::Parse`] if a file cannot be read as the certificate or key it
-    /// should hold, or if the key does not belong to the intermediate.
+    /// should hold, if the key does not belong to the intermediate, or if the
+    /// intermediate does not chain to the root: its issuer is not the root's
+    /// subject, the root's key did not sign it, or its name constraints are
+    /// not the root's.
     pub fn from_pem(root_pem: &str, issuer_pem: &str, issuer_key_pem: &str) -> Result<Self, Error> {
         let issuer_key =
             KeyPair::from_pem(issuer_key_pem).map_err(|_| Error::Parse("issuer key"))?;
@@ -174,7 +178,28 @@ impl Ca {
             ));
         }
         let root_der = pem_der(root_pem, "root certificate")?;
-        let constraints = constraints_of(&parse_cert(&root_der, "root certificate")?)?;
+        let root = parse_cert(&root_der, "root certificate")?;
+        if issuer.issuer().as_raw() != root.subject().as_raw() {
+            return Err(Error::Parse(
+                "issuer certificate was not issued by the root",
+            ));
+        }
+        // homecert only makes P-256 keys and ECDSA with SHA-256 signatures.
+        UnparsedPublicKey::new(
+            &ECDSA_P256_SHA256_ASN1,
+            root.public_key().subject_public_key.data.as_ref(),
+        )
+        .verify(
+            issuer.tbs_certificate.as_ref(),
+            issuer.signature_value.data.as_ref(),
+        )
+        .map_err(|_| Error::Parse("issuer certificate was not signed by the root key"))?;
+        let constraints = constraints_of(&root)?;
+        if constraints_of(&issuer)? != constraints {
+            return Err(Error::Parse(
+                "issuer name constraints differ from the root's",
+            ));
+        }
         Ok(Self {
             root_pem: root_pem.to_owned(),
             issuer_pem: issuer_pem.to_owned(),

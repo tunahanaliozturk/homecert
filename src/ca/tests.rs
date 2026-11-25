@@ -364,6 +364,85 @@ fn a_key_that_does_not_belong_to_the_issuer_is_refused() {
     assert!(Ca::from_pem(a.root_pem(), a.issuer_pem(), &b.issuer_key_pem()).is_err());
 }
 
+/// A root and intermediate built by hand from the same parts as
+/// [`Ca::create`], so a test can give them different constraints or a root
+/// a different key. Returns the three PEM files.
+fn hand_built(root_cn: &str, root: &Constraints, issuer: &Constraints) -> (String, String, String) {
+    let now = OffsetDateTime::now_utc();
+    let later = now + Duration::days(30);
+    let root = CertifiedIssuer::self_signed(
+        ca_params(root_cn.to_owned(), now, later, root, 1),
+        new_key().unwrap(),
+    )
+    .unwrap();
+    let issuer_key = new_key().unwrap();
+    let issuer_cert = ca_params("hand-built issuer".to_owned(), now, later, issuer, 0)
+        .signed_by(&issuer_key, &root)
+        .unwrap();
+    (root.pem(), issuer_cert.pem(), issuer_key.serialize_pem())
+}
+
+#[test]
+fn a_root_and_issuer_from_two_cas_are_refused() {
+    let now = OffsetDateTime::now_utc();
+    let a = Ca::create(Constraints::local(), now).unwrap();
+    let b = Ca::create(Constraints::local(), now).unwrap();
+    let err = Ca::from_pem(a.root_pem(), b.issuer_pem(), &b.issuer_key_pem()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Parse("issuer certificate was not issued by the root")
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_issuer_not_signed_by_the_root_is_refused() {
+    // A second root with the same subject but its own key: the names chain,
+    // the signature does not.
+    let a = Ca::create(Constraints::local(), OffsetDateTime::now_utc()).unwrap();
+    let root_der = ders(a.root_pem()).remove(0);
+    let cn = common_name(&parse(&root_der)).to_owned();
+    let (impostor, _, _) = hand_built(&cn, &Constraints::local(), &Constraints::local());
+    let impostor_der = ders(&impostor).remove(0);
+    assert_eq!(parse(&impostor_der).subject(), parse(&root_der).subject());
+    let err = Ca::from_pem(&impostor, a.issuer_pem(), &a.issuer_key_pem()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Parse("issuer certificate was not signed by the root key")
+        ),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_issuer_whose_constraints_differ_from_the_roots_is_refused() {
+    let local = Constraints::local();
+    // The control: the hand-built chain loads when the constraints agree.
+    let (root, issuer, key) = hand_built("hand-built root", &local, &local);
+    assert!(Ca::from_pem(&root, &issuer, &key).is_ok());
+
+    let wider = Constraints::new(
+        vec![
+            DnsName::parse("test").unwrap(),
+            DnsName::parse("com").unwrap(),
+        ],
+        vec![IpNet::parse("127.0.0.0/8").unwrap()],
+    )
+    .unwrap();
+    let (root, issuer, key) = hand_built("hand-built root", &local, &wider);
+    let err = Ca::from_pem(&root, &issuer, &key).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Parse("issuer name constraints differ from the root's")
+        ),
+        "{err}"
+    );
+}
+
 /// `openssl verify`'s verdict, or `None` when openssl cannot be run.
 fn openssl_accepts(dir: &std::path::Path, ca: &Ca, leaf: &Leaf) -> Option<Result<bool, String>> {
     let leaf_only = leaf.chain_pem().strip_suffix(ca.issuer_pem()).unwrap();
