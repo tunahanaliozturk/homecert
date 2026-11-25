@@ -1,3 +1,6 @@
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
+
+# syn 2 and syn 3 both come in through x509-parser's proc macros; nothing here can unify them.
+allowed-duplicate-crates = ["syn"]

@@ -44,3 +44,13 @@ redundant_closure_for_method_calls = "warn"
 semicolon_if_nothing_returned = "warn"
 todo = "warn"
 unwrap_used = "warn"
+
+[dependencies]
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
+ring = "0.17.14"
+time = "0.3.44"
+x509-parser = "0.18.1"
+
+[dev-dependencies]
+rustls-webpki = { version = "0.103.17", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1.16.0"
