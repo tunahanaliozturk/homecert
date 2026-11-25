@@ -149,7 +149,7 @@ $ echo $?
 
 ## Architecture
 
-One binary crate. Modules, with what is pure and what does I/O:
+One package with a library target that holds the modules and a thin binary that calls them. The library target exists so that tests can reach every module, including the test-only `Ca::issue_unchecked`; nothing is published as a library. Modules, with what is pure and what does I/O:
 
 | Module | Job | I/O |
 | --- | --- | --- |
@@ -193,18 +193,20 @@ pub trait Store {
 
 `names::permits(&Constraints, &SubjectName) -> bool` is the one function that decides whether a name may be issued. `issue` calls it before signing. It follows RFC 5280 section 4.2.1.10: a DNS constraint `test` permits `test` and any name made by adding labels on the left, compared label by label, so `xtest` and `test.evil` are outside it. A wildcard `*.a.test` is checked as `a.test`. An IP address must fall inside one of the IP ranges, and an IPv4-mapped IPv6 address such as `::ffff:127.0.0.1` is treated as IPv6 and refused unless an IPv6 range covers it.
 
+A constraint list needs at least one DNS name. An empty IP list means no address may be issued, and is written into the certificates as an excluded subtree covering all IPv4 and IPv6 addresses, because a permitted list restricts only names of its own type ([ADR 0006](adr/0006-empty-ip-list-is-excluded.md)).
+
 ### The certificates
 
 All keys are ECDSA P-256, made by rcgen with ring. ring cannot generate RSA keys ([rcgen](https://github.com/rustls/rcgen) 0.14.10 returns `KeyGenerationUnavailable` for RSA without aws-lc-rs), and every consumer in scope accepts P-256.
 
 | | Root | Intermediate (issuer) | Leaf |
 | --- | --- | --- | --- |
-| Subject CN | `homecert root <date> <4 random hex>` | `homecert issuer <date> <4 random hex>` | first name in the request |
+| Subject CN | `homecert root <date> <4 random hex>` | `homecert issuer <date> <4 random hex>` | first DNS name in the request; with only IP addresses, no CN and `O=homecert` ([ADR 0007](adr/0007-leaf-common-name.md)) |
 | Validity | 5 years | same as the root | 365 days by default, at most 825 |
 | Basic constraints | CA, path length 1 | CA, path length 0 | not a CA |
 | Key usage | certificate sign, CRL sign | certificate sign, CRL sign | digital signature |
 | Extended key usage | none | server auth | server auth |
-| Name constraints | yes, critical | yes, critical, the same list | none |
+| Name constraints | yes, critical; an empty IP list adds an excluded subtree for all addresses | yes, critical, the same list | none |
 | Subject alternative names | none | none | every requested name |
 | Key stored | **never** | `issuer-key.pem`, owner-only | `<name>-key.pem`, owner-only |
 
@@ -326,10 +328,10 @@ The refusal in `issue` is only useful if it matches what verifiers do. A name ho
 Levels, from cheap to expensive:
 
 1. **Unit tests on pure code.** `names` gets a table of at least 60 cases: exact matches, subdomains, label-boundary traps (`xtest`, `test.evil`, `localhost.evil.com`, `127.0.0.1.nip.io`), trailing dots, upper case, punycode, wildcards at each level, IPv4 and IPv6 edges (`127.255.255.255`, `128.0.0.1`, `::1`, `::2`, `::ffff:127.0.0.1`). `plan` is tested with fake `Machine` values: every combination of present and missing stores gives the expected steps, and an `uninstall` plan after an `install` plan is its exact inverse.
-2. **Certificates checked by a second implementation.** Each issued chain is parsed back with x509-parser and its fields compared with the profile table above. Then rustls-webpki (a dev-dependency) verifies it with the root as anchor. Every name in the table is issued twice: through `issue`, and through a test-only `issue_unchecked` that skips `permits`. For every name, `permits` must agree with webpki's verdict on the unchecked certificate.
+2. **Certificates checked by a second implementation.** Each issued chain is parsed back with x509-parser and its fields compared with the profile table above. Then rustls-webpki (a dev-dependency) verifies it with the root as anchor. Every name in the table is issued twice: through `issue`, and through a test-only `issue_unchecked` that skips `permits`. For every name, `permits` must agree with webpki's verdict on the unchecked certificate. Where `openssl` on `PATH` is OpenSSL (not LibreSSL, which macOS ships under that name), the same table goes through `openssl verify` as a third opinion; it found the leaf common name problem in [ADR 0007](adr/0007-leaf-common-name.md), which webpki cannot see because it ignores the CN.
 3. **Deliberately wrong variants.** These must fail the tests that guard them:
    - `permits` with a plain string suffix check instead of label comparison: the table catches `xtest`.
-   - A root built without constraints: the webpki cross-check catches it.
+   - A root built without constraints: the profile test catches it, and so does reading the CA back, since the constraints come from `root.pem`. The webpki cross-check does not, because the intermediate carries the same constraints and webpki enforces those.
    - An intermediate built without constraints: the Java probe (level 4) catches it.
    - A key file created without the mode: the permission test catches it.
    - `uninstall` matching by subject instead of fingerprint: the store test with a decoy certificate of the same subject catches it.
@@ -351,21 +353,22 @@ Binaries for x86_64 and aarch64 on all three systems. Other Linux families get a
 
 ## Dependencies
 
-Planned, none added yet. All have permissive licences that `deny.toml` allows.
+rcgen, ring, x509-parser, time and the two dev-only crates were added in M1; the others are still planned. All have permissive licences that `deny.toml` allows.
 
 | Crate | Version checked | Licence | Why |
 | --- | --- | --- | --- |
 | rcgen, features `crypto`, `pem`, `ring`, `x509-parser`, no defaults | 0.14.10 (2026-08-28) | MIT OR Apache-2.0 | Builds the certificates, including name constraints with DNS and IP subtrees (`NameConstraints`, `GeneralSubtree::DnsName`, `GeneralSubtree::IpAddress(CidrSubnet)`); `Issuer::from_ca_cert_pem` signs leaves with the stored intermediate. |
-| ring | 0.17.14 | Apache-2.0 AND ISC | Already pulled in by rcgen; SHA-256 and SHA-1 fingerprints. Chosen over aws-lc-rs because aws-lc-sys needs CMake and NASM on Windows and some versions carried the OpenSSL licence. |
+| ring | 0.17.14 | Apache-2.0 AND ISC | Already pulled in by rcgen; the random part of CA names now, SHA-256 and SHA-1 fingerprints later. Chosen over aws-lc-rs because aws-lc-sys needs CMake and NASM on Windows and some versions carried the OpenSSL licence. |
 | x509-parser | 0.18.1 | MIT OR Apache-2.0 | Reads certificates back: validity, constraints, subject. Already pulled in by rcgen's feature. |
-| time | as required by rcgen | MIT OR Apache-2.0 | rcgen takes validity as `time::OffsetDateTime`. |
+| time | 0.3.55 | MIT OR Apache-2.0 | rcgen takes validity as `time::OffsetDateTime`. |
 | lexopt | 0.3.2 | MIT | Argument parsing with no dependencies. The command set is small enough that hand-written help is fine; clap would add at least four crates. |
 | schannel (Windows only) | 0.1.30 | MIT | Safe wrapper over the Windows certificate store: open, add, enumerate, delete, fingerprint. Keeps the crate free of `unsafe`. |
-| rustls-webpki (dev only) | 0.103.17 | ISC | An independent verifier that enforces constraints from the anchor, for the cross-check tests. |
+| rustls-webpki (dev only), features `ring`, `std` | 0.103.17 | ISC | An independent verifier that enforces constraints from the anchor, for the cross-check tests. |
+| rustls-pki-types (dev only) | 1.16.0 | MIT OR Apache-2.0 | The certificate and time types webpki takes. Already pulled in by rcgen. |
 
 No crate for macOS: `/usr/bin/security` covers adding, removing and listing trust, and security-framework 3.7 has no call to remove trust settings. No crate for directories, WSL or OS detection: environment variables, `/etc/os-release` and `/proc` are enough. No serde: there is no state file. No networking code at all.
 
-The MSRV is 1.88 because rcgen 0.14.8 and later need it.
+The MSRV is 1.88 because rcgen 0.14.8 and later need it, and so does time 0.3.55. x509-parser brings in syn 2 and syn 3 through its proc macros; `clippy.toml` allows that one duplicate.
 
 ## Security considerations
 
@@ -381,7 +384,7 @@ The MSRV is 1.88 because rcgen 0.14.8 and later need it.
 
 ## Open questions
 
-1. **Windows and constraints in a root.** No Microsoft statement says whether CryptoAPI enforces name constraints in a self-signed root, nor how it treats IP constraints. The M2 probe answers it on the runner.
+1. **Windows and constraints in a root.** No Microsoft statement says whether CryptoAPI enforces name constraints in a self-signed root, nor how it treats IP constraints. Partly answered on 2026-11-25, read-only: on Windows 11 (build 26100) with .NET 10.0.12, `X509Chain` in `CustomRootTrust` mode, which builds the chain with CryptoAPI and the root as an in-memory exclusive anchor, rejected leaves for `example.com`, `10.0.0.5` and `2001:db8::1` under an unconstrained intermediate from a root constrained to `test` and `127.0.0.0/8`, with `HasNotPermittedNameConstraint`, and accepted `app.test`, `127.0.0.1` and an unconstrained control chain. Nothing was added to a store. Whether CryptoAPI does the same for a root trusted through the `Root` store is still open; the M2 probe answers it on the runner.
 2. **The Windows dialog.** Does removing a certificate from `CurrentUser\Root` also show a dialog? What happens to `add` in a session with no desktop? Are GitHub's Windows runners elevated, so that `windows-machine` works in CI?
 3. **macOS on CI.** Does `sudo security add-trusted-cert -d` work on current GitHub macOS runners, or does it need the interaction that mkcert #415 describes?
 4. **Servers and the chain.** Which common server stacks send only the first certificate of a PEM file? This decides whether the intermediate also goes into the intermediate stores.
