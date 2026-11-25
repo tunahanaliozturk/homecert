@@ -42,7 +42,8 @@ impl fmt::Display for NameError {
 
 impl std::error::Error for NameError {}
 
-/// A DNS name: lower case, no trailing dot, A-labels only.
+/// A DNS name: lower case, no trailing dot, ASCII letters, digits and
+/// hyphens only.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DnsName(String);
 
@@ -50,8 +51,9 @@ impl DnsName {
     /// Parses and normalises a DNS name. One trailing dot is removed and the
     /// name is lower-cased. Each label is 1 to 63 letters, digits and inner
     /// hyphens; the last label is not all digits; the whole name is at most
-    /// 253 characters. Internationalised names must be given as A-labels
-    /// (`xn--...`).
+    /// 253 characters. Non-ASCII names are refused, so an internationalised
+    /// name has to be given in its `xn--` form; such a label is accepted as
+    /// letters, digits and hyphens and is not checked to be valid punycode.
     ///
     /// # Errors
     ///
@@ -121,7 +123,8 @@ impl SubjectName {
     ///
     /// # Errors
     ///
-    /// [`NameError::Malformed`] if it is none of those, and
+    /// [`NameError::Malformed`] if it is none of those, or a wildcard longer
+    /// than 253 characters with its `*.`, and
     /// [`NameError::WildcardTooBroad`] for a wildcard directly under one label,
     /// such as `*.test`.
     pub fn parse(input: &str) -> Result<Self, NameError> {
@@ -130,6 +133,10 @@ impl SubjectName {
         }
         if let Some(base) = input.strip_prefix("*.") {
             let base = DnsName::parse(base)?;
+            // The `*.` counts towards the 253 characters of the full name.
+            if base.0.len() + 2 > 253 {
+                return Err(NameError::Malformed(input.to_owned()));
+            }
             if !base.0.contains('.') {
                 return Err(NameError::WildcardTooBroad(input.to_owned()));
             }
@@ -473,6 +480,24 @@ mod tests {
         assert_eq!(
             SubjectName::parse("*.test"),
             Err(NameError::WildcardTooBroad("*.test".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_wildcard_counts_its_star_towards_253_characters() {
+        // Three 63-character labels and one of `last`: 192 + `last` long.
+        let base = |last: usize| {
+            let full = ["a", "b", "c"].map(|c| c.repeat(63)).join(".");
+            format!("{full}.{}", "d".repeat(last))
+        };
+        assert_eq!(base(59).len(), 251);
+        let fits = format!("*.{}", base(59));
+        assert_eq!(SubjectName::parse(&fits).unwrap().to_string(), fits);
+        let too_long = format!("*.{}", base(60));
+        assert!(DnsName::parse(&base(60)).is_ok());
+        assert_eq!(
+            SubjectName::parse(&too_long),
+            Err(NameError::Malformed(too_long.clone()))
         );
     }
 

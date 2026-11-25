@@ -168,7 +168,7 @@ Data flow for `install`: `cli` parses, `probe` builds a `Machine`, each selected
 
 ```rust
 pub struct Constraints { dns: Vec<DnsName>, ip: Vec<IpNet> }   // what the root permits
-pub struct DnsName(String);          // lower case, no trailing dot, A-labels only
+pub struct DnsName(String);          // lower case, no trailing dot, ASCII LDH only; xn-- not decoded
 pub enum   SubjectName { Dns(DnsName), Wildcard(DnsName), Ip(IpAddr) }
 pub struct Fingerprint([u8; 32]);    // SHA-256 of the certificate DER
 pub struct Ca { root: CertDer, issuer: CertDer, issuer_key: KeyPem, constraints: Constraints }
