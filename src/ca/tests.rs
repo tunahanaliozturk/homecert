@@ -333,6 +333,30 @@ fn an_empty_ip_list_is_written_as_an_excluded_subtree_and_read_back() {
 }
 
 #[test]
+fn only_the_v4_and_v6_exclusion_reads_as_no_ip_addresses() {
+    // A doubled 0.0.0.0/0 excludes every IPv4 address but leaves IPv6 open,
+    // so it must not read back as "no IP addresses".
+    let dns_only =
+        Constraints::new(vec![DnsName::parse("corp.example").unwrap()], Vec::new()).unwrap();
+    let all_v4 = || GeneralSubtree::IpAddress(CidrSubnet::from_v4_prefix([0; 4], 0));
+    let all_v6 = || GeneralSubtree::IpAddress(CidrSubnet::from_v6_prefix([0; 16], 0));
+    let now = OffsetDateTime::now_utc();
+    let read_back = |excluded: Vec<GeneralSubtree>| {
+        let mut params = ca_params("excluded".to_owned(), now, now, &dns_only, 1);
+        params.name_constraints.as_mut().unwrap().excluded_subtrees = excluded;
+        let der = params
+            .self_signed(&new_key().unwrap())
+            .unwrap()
+            .der()
+            .to_vec();
+        constraints_of(&parse(&der))
+    };
+    assert_eq!(read_back(vec![all_v4(), all_v6()]).unwrap(), dns_only);
+    assert!(read_back(vec![all_v4(), all_v4()]).is_err());
+    assert!(read_back(vec![all_v6(), all_v6()]).is_err());
+}
+
+#[test]
 fn the_root_key_is_never_stored() {
     let tmp = TempDir::new();
     let ca = Ca::create(Constraints::local(), OffsetDateTime::now_utc()).unwrap();

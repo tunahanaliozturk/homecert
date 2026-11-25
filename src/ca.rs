@@ -394,8 +394,10 @@ fn constraints_of(cert: &X509Certificate<'_>) -> Result<Constraints, Error> {
         GeneralName::IPAddress(&[0; 8]),
         GeneralName::IPAddress(&[0; 32]),
     ];
-    let excluded_ok = excluded.is_empty()
-        || (ip.is_empty() && excluded.len() == 2 && excluded.iter().all(|e| all_ip.contains(e)));
+    // Exactly the IPv4 and the IPv6 exclusion, as `name_constraints` writes
+    // them: a doubled 0.0.0.0/0 would leave every IPv6 address open.
+    let excluded_ok =
+        excluded.is_empty() || (ip.is_empty() && excluded == [&all_ip[0], &all_ip[1]]);
     if !excluded_ok {
         return Err(unsupported);
     }
