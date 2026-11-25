@@ -257,9 +257,24 @@ pub(crate) mod windows {
     /// `%SystemRoot%\System32\<exe>`, so a program of the same name earlier
     /// on `PATH` is not run instead.
     pub(crate) fn system32(exe: &str) -> Result<PathBuf, Error> {
-        let root = std::env::var_os("SystemRoot")
-            .ok_or_else(|| Error::Permissions("SystemRoot is not set".to_owned()))?;
-        Ok(PathBuf::from(root).join("System32").join(exe))
+        system32_in(std::env::var_os("SystemRoot"), exe)
+    }
+
+    /// [`system32`] with the value of `SystemRoot` passed in.
+    pub(crate) fn system32_in(
+        root: Option<std::ffi::OsString>,
+        exe: &str,
+    ) -> Result<PathBuf, Error> {
+        let root = PathBuf::from(
+            root.ok_or_else(|| Error::Permissions("SystemRoot is not set".to_owned()))?,
+        );
+        if !root.is_absolute() {
+            return Err(Error::Permissions(format!(
+                "SystemRoot is not an absolute path: {:?}",
+                root.display().to_string()
+            )));
+        }
+        Ok(root.join("System32").join(exe))
     }
 
     /// The current user's SID, from `whoami /user /fo csv /nh`, whose output
@@ -429,6 +444,25 @@ mod tests {
         }
         drop(held);
         assert!(File::open(&path).is_ok());
+    }
+
+    /// An empty or relative `SystemRoot` would make `icacls` and `whoami`
+    /// resolve against the current directory.
+    #[cfg(windows)]
+    #[test]
+    fn system_root_must_be_an_absolute_path() {
+        use super::windows::system32_in;
+        for root in [None, Some(""), Some("Windows"), Some(r"..\Windows")] {
+            let result = system32_in(root.map(Into::into), "icacls.exe");
+            assert!(
+                matches!(result, Err(Error::Permissions(_))),
+                "{root:?}: {result:?}"
+            );
+        }
+        assert_eq!(
+            system32_in(Some(r"C:\Windows".into()), "icacls.exe").unwrap(),
+            Path::new(r"C:\Windows\System32\icacls.exe")
+        );
     }
 
     #[test]
