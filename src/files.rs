@@ -139,8 +139,7 @@ pub fn write_file(
     if overwrite == Overwrite::Refuse && path.exists() {
         return Err(Error::Exists(path.to_owned()));
     }
-    let tmp = temp_path(path);
-    let mut file = create_new(&tmp, access)?;
+    let (tmp, mut file) = create_temp(path, access)?;
     let result = fill(&mut file, &tmp, bytes);
     drop(file);
     let result = result.and_then(|()| place(&tmp, path, overwrite));
@@ -148,6 +147,25 @@ pub fn write_file(
         fs::remove_file(&tmp).ok();
     }
     result
+}
+
+/// Creates a fresh temporary file next to `path`. A name that already exists
+/// belongs to someone else, so it is left alone and the next number is tried,
+/// up to 16 times.
+fn create_temp(path: &Path, access: Access) -> Result<(PathBuf, File), Error> {
+    const RETRIES: u32 = 16;
+    let mut retries = 0;
+    loop {
+        let tmp = temp_path(path);
+        match create_new(&tmp, access) {
+            Err(Error::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists && retries < RETRIES =>
+            {
+                retries += 1;
+            }
+            result => return result.map(|file| (tmp, file)),
+        }
+    }
 }
 
 fn fill(file: &mut File, tmp: &Path, bytes: &[u8]) -> Result<(), Error> {
@@ -200,9 +218,14 @@ fn link_error(path: &Path, e: &std::io::Error) -> Error {
     }
 }
 
+/// Numbers the temporary names this process makes.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn temp_path(path: &Path) -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    temp_name(path, TEMP_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+fn temp_name(path: &Path, n: u64) -> PathBuf {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -492,6 +515,23 @@ mod tests {
             .unwrap();
         place(&temp, &path, Overwrite::Refuse).unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn a_taken_temporary_name_is_skipped() {
+        let dir = TempDir::new();
+        let path = dir.path().join("key.pem");
+        // Someone else holds the next few temporary names.
+        let next = TEMP_COUNTER.load(Ordering::Relaxed);
+        let taken: Vec<_> = (next..next + 4).map(|n| temp_name(&path, n)).collect();
+        for squatter in &taken {
+            fs::write(squatter, b"not ours").unwrap();
+        }
+        write_file(&path, b"secret", Access::OwnerOnly, Overwrite::Refuse).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"secret");
+        for squatter in &taken {
+            assert_eq!(fs::read(squatter).unwrap(), b"not ours");
+        }
     }
 
     #[test]
