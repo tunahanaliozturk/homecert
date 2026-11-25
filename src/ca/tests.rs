@@ -58,8 +58,10 @@ fn webpki_accepts(ca: &Ca, leaf: &Leaf, at: OffsetDateTime) -> Result<bool, webp
     }
 }
 
-/// Issues every parseable name in `cases` without the `permits` check and
-/// returns the names where `permits` and `verifier` disagree.
+/// Issues every parseable name in `cases` twice: through [`Ca::issue`],
+/// which must succeed exactly when `permits` does, and without the `permits`
+/// check, for `verifier` to judge. Returns the names where `permits`,
+/// `issue` and `verifier` do not all agree.
 fn disagreements(
     ca: &Ca,
     cases: &[&str],
@@ -75,6 +77,12 @@ fn disagreements(
             .issue_unchecked(std::slice::from_ref(&name), LeafDays::default(), now)
             .unwrap();
         let ours = permits(ca.constraints(), &name);
+        match ca.issue(std::slice::from_ref(&name), LeafDays::default(), now) {
+            Ok(_) if !ours => wrong.push(format!("{input}: issue signed a name permits refuses")),
+            Err(Error::Refused(_)) if ours => wrong.push(format!("{input}: issue refused it")),
+            Ok(_) | Err(Error::Refused(_)) => {}
+            Err(e) => wrong.push(format!("{input}: issue failed: {e}")),
+        }
         match verifier(&leaf) {
             Ok(theirs) if theirs == ours => {}
             Ok(theirs) => wrong.push(format!("{input}: permits {ours}, verifier {theirs}")),
