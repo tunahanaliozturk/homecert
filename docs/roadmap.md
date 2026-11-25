@@ -16,6 +16,13 @@ Each milestone ends with a test that has to pass. A milestone is not done becaus
 ## Progress
 
 - **M0**, 2026-11-22: done. Scaffold, design, roadmap and five ADRs. Facts were checked against primary sources on 2026-11-22; the design lists ten open questions, most of which M2 and M4 answer.
+- **M1**, 2026-11-25: built and passing locally on Windows 11 (Rust 1.99.1, windows-gnu); not yet pushed, so the three-system CI run is still to come. `names`, `ca`, `files` and `issue` are in a library target; there is no command line yet. Evidence:
+  - The name table has 82 inputs, 65 of which parse and are issued without the `permits` check. rustls-webpki agrees with `permits` on all 65 (`webpki_agrees_with_permits_on_every_table_name`), and so does OpenSSL 3.5.6 (`openssl_agrees_with_permits_on_every_table_name`). Two DNS-only and IPv4-only constraint lists are cross-checked as well.
+  - `every_certificate_field_matches_the_profile_table` checks each row of the profile table in the three certificates. `the_root_key_is_never_stored` checks that the CA directory holds exactly three files and that its one key is the intermediate's.
+  - Label-suffix mutation of `permits` (`ends_with` instead of a label comparison), made by hand: it compiled, and the table test, the webpki cross-check, the second webpki cross-check and the OpenSSL cross-check failed, on `xtest`, `apptest`, `notlocalhost`, `xhome.arpa`, `evil-home.arpa`, `*.app.xtest` and `xcorp.example`.
+  - DACL left out by hand on Windows, once for files and once for the CA directory: it compiled, and the owner-only tests failed in each case (`protected False` and inherited entries in the ACL read back by `Get-Acl`).
+  - The Unix mode mutation was not run, since this machine has no Linux toolchain or running container engine. The tests that would catch it (`the_ca_directory_and_issuer_key_are_owner_only`, `a_private_file_outside_the_ca_directory_is_owner_only`) and their negative control (`the_owner_only_check_rejects_a_plainly_written_file`, a file written without a mode must fail the check) run on Linux and macOS in CI.
+  - Two decisions came out of the tests: [ADR 0006](adr/0006-empty-ip-list-is-excluded.md) (an empty IP list is an excluded subtree) and [ADR 0007](adr/0007-leaf-common-name.md) (no IP address as the leaf CN, found by the OpenSSL cross-check).
 
 ## Order of work inside a milestone
 
