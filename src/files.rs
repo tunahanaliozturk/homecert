@@ -168,7 +168,10 @@ fn place(tmp: &Path, path: &Path, overwrite: Overwrite) -> Result<(), Error> {
                 std::io::ErrorKind::AlreadyExists => Error::Exists(path.to_owned()),
                 _ => Error::io(path, e),
             })?;
-            fs::remove_file(tmp).map_err(|e| Error::io(tmp, e))
+            // The file is in place now. A temporary name left behind is
+            // untidy, not a failed write.
+            fs::remove_file(tmp).ok();
+            Ok(())
         }
     }
 }
@@ -444,6 +447,27 @@ mod tests {
         }
         drop(held);
         assert!(File::open(&path).is_ok());
+    }
+
+    /// Once the hard link is made the file is in place; a temporary name that
+    /// cannot be removed must not turn that into an error. Windows refuses to
+    /// delete a file that is open without delete sharing, which makes the
+    /// removal fail on demand.
+    #[cfg(windows)]
+    #[test]
+    fn a_temporary_file_that_cannot_be_removed_does_not_fail_the_write() {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        let dir = TempDir::new();
+        let (temp, path) = (dir.path().join("t.tmp"), dir.path().join("key.pem"));
+        fs::write(&temp, b"secret").unwrap();
+        let _pin = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&temp)
+            .unwrap();
+        place(&temp, &path, Overwrite::Refuse).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"secret");
     }
 
     /// An empty or relative `SystemRoot` would make `icacls` and `whoami`
