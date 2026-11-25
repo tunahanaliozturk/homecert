@@ -203,6 +203,40 @@ fn a_leaf_does_not_outlive_its_issuer() {
 }
 
 #[test]
+fn leaf_serials_are_random_and_positive() {
+    let ca = Ca::create(Constraints::local(), OffsetDateTime::now_utc()).unwrap();
+    let leaves: Vec<_> = (0..2)
+        .map(|_| {
+            let leaf = ca
+                .issue(
+                    &names(&["app.test"]),
+                    LeafDays::default(),
+                    OffsetDateTime::now_utc(),
+                )
+                .unwrap();
+            ders(leaf.chain_pem()).remove(0)
+        })
+        .collect();
+    let serials: Vec<&[u8]> = leaves.iter().map(|der| parse(der).raw_serial()).collect();
+    assert_ne!(serials[0], serials[1]);
+    for der in &leaves {
+        let leaf = parse(der);
+        let serial = leaf.raw_serial();
+        assert!(serial.len() >= 8, "{serial:02x?}");
+        assert_eq!(serial[0] & 0x80, 0, "negative: {serial:02x?}");
+        // Not rcgen's default: SHA-256 of the public key, cut to 20 bytes.
+        let hash = ring::digest::digest(
+            &ring::digest::SHA256,
+            &leaf.public_key().subject_public_key.data,
+        );
+        let mut derived = hash.as_ref()[..20].to_vec();
+        derived[0] &= 0x7f;
+        let derived: Vec<u8> = derived.into_iter().skip_while(|b| *b == 0).collect();
+        assert_ne!(serial, derived.as_slice(), "serial derived from the key");
+    }
+}
+
+#[test]
 fn leaf_validity_is_one_to_825_days() {
     assert!(LeafDays::new(0).is_err());
     assert!(LeafDays::new(826).is_err());

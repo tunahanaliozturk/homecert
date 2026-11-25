@@ -10,7 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, CidrSubnet, DistinguishedName, DnType,
     ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, Issuer, KeyPair, KeyUsagePurpose,
-    NameConstraints, PKCS_ECDSA_P256_SHA256, SanType,
+    NameConstraints, PKCS_ECDSA_P256_SHA256, SanType, SerialNumber,
 };
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey};
@@ -277,6 +277,7 @@ impl Ca {
             return Err(Error::NoNames);
         }
         let mut params = CertificateParams::default();
+        params.serial_number = Some(random_serial()?);
         params.not_before = now;
         params.not_after = (now + Duration::days(i64::from(days.get()))).min(self.issuer_not_after);
         params.distinguished_name = leaf_subject(names);
@@ -449,6 +450,20 @@ fn random_hex() -> Result<String, Error> {
         .fill(&mut bytes)
         .map_err(|_| Error::Random)?;
     Ok(format!("{:02x}{:02x}", bytes[0], bytes[1]))
+}
+
+/// A random positive serial number: 16 bytes from the system random source,
+/// with the top bit cleared so the number is positive and the next bit set so
+/// it always takes all 16 bytes. That leaves 126 random bits; the CA/Browser
+/// Forum asks for at least 64. Without it rcgen derives the serial from a
+/// hash of the public key.
+fn random_serial() -> Result<SerialNumber, Error> {
+    let mut bytes = [0u8; 16];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| Error::Random)?;
+    bytes[0] = (bytes[0] & 0x7f) | 0x40;
+    Ok(SerialNumber::from_slice(&bytes))
 }
 
 /// The DER of the first certificate in a PEM string.
