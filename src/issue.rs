@@ -59,16 +59,18 @@ impl Output {
     }
 }
 
-/// Issues a leaf for `names` from the CA in `ca_dir`. Every name is checked
-/// before anything is signed or written. The key is written owner-only and
-/// never over an existing file; the certificate chain replaces an existing
-/// file.
+/// Issues a leaf for `names` from the CA in `ca_dir`. Every name and both
+/// target paths are checked before anything is signed or written. The key is
+/// written owner-only and never over an existing file; the certificate chain
+/// replaces an existing file. If the chain cannot be written, the key written
+/// for it is removed again, so a rerun does not fail on it.
 ///
 /// # Errors
 ///
 /// [`Error::Refused`] for a name outside the CA's constraints, with nothing
-/// written; [`Error::Exists`] if the key file exists; otherwise the errors of
-/// [`CaDir::load`], [`crate::ca::Ca::issue`] and [`write_file`].
+/// written; [`Error::Exists`] if the key file exists; [`Error::Io`] if the
+/// certificate path is a directory; otherwise the errors of [`CaDir::load`],
+/// [`crate::ca::Ca::issue`] and [`write_file`].
 pub fn issue(
     ca_dir: &CaDir,
     names: &[SubjectName],
@@ -76,6 +78,15 @@ pub fn issue(
     days: LeafDays,
     now: OffsetDateTime,
 ) -> Result<(), Error> {
+    if output.key.exists() {
+        return Err(Error::Exists(output.key.clone()));
+    }
+    if output.cert.is_dir() {
+        return Err(Error::io(
+            &output.cert,
+            std::io::ErrorKind::IsADirectory.into(),
+        ));
+    }
     let leaf = ca_dir.load()?.issue(names, days, now)?;
     write_file(
         &output.key,
@@ -89,6 +100,9 @@ pub fn issue(
         Access::Public,
         Overwrite::Replace,
     )
+    .inspect_err(|_| {
+        std::fs::remove_file(&output.key).ok();
+    })
 }
 
 #[cfg(test)]
@@ -183,5 +197,42 @@ mod tests {
         );
         assert!(matches!(err, Err(Error::Exists(_))));
         assert_eq!(std::fs::read(out.key()).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn a_failed_certificate_write_leaves_no_key_behind() {
+        let tmp = TempDir::new();
+        let dir = ca_dir(&tmp);
+        let list = names(&["app.test"]);
+        let key = tmp.path().join("app.test-key.pem");
+        let out = Output::new(tmp.path().join("missing").join("app.test.pem"), &key);
+        let issue_once = || {
+            issue(
+                &dir,
+                &list,
+                &out,
+                LeafDays::default(),
+                OffsetDateTime::now_utc(),
+            )
+        };
+        assert!(matches!(issue_once(), Err(Error::Io { .. })));
+        assert!(!key.exists(), "the key was left behind");
+        // A rerun fails the same way, not with `Exists`.
+        assert!(matches!(issue_once(), Err(Error::Io { .. })));
+
+        // A directory as the certificate path is caught before signing.
+        let out = Output::new(tmp.path(), &key);
+        let err = issue(
+            &dir,
+            &list,
+            &out,
+            LeafDays::default(),
+            OffsetDateTime::now_utc(),
+        );
+        assert!(
+            matches!(&err, Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::IsADirectory),
+            "{err:?}"
+        );
+        assert!(!key.exists());
     }
 }
